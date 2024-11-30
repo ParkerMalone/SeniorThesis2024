@@ -21,6 +21,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 import json
 import random
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=(
+        "You are using `torch.load` with `weights_only=False`.*"
+    ),
+    category=FutureWarning,
+)
 
 class FlashProjectorInstance:
 
@@ -281,17 +290,23 @@ class TowerGrid:
         return self.tower_locations
 
     def get_possible_upgrades(self, current_money):
-        possible_upgrades = []
+        possible_upgrades = []  #less or equal than current money
+        wait_upgrades = []      #too expensive
 
         for x, y in self.tower_locations:
             tower = self.map_grid[y][x]
             if isinstance(tower, Tower):
-                upgrades = tower.get_upgrade_info(current_money)
+                upgrades, wait = tower.get_upgrade_info(current_money)
 
-                if upgrades[0] != None:    #add (x, y), upgrades if it can be upgraded
+                #add upgrades if they exist
+                if upgrades and upgrades[0] is not None:  #check for nonempty and not None
                     possible_upgrades.append(((x, y), upgrades))
 
-        return possible_upgrades
+                #add wait options if they exist
+                if wait and wait[0] is not None:  #check for nonempty and not None
+                    wait_upgrades.append(((x, y), wait))
+
+        return possible_upgrades, wait_upgrades
     
     def grid_to_tensor(self):
         grid_tensor = torch.zeros((len(self.map_grid), len(self.map_grid[0])), dtype=torch.int)
@@ -460,25 +475,29 @@ class Tower:
 
     def get_upgrade_info(self, current_money):
         upgrades_list = []
+        wait_list = []
+
+        #if max level, return empty lists
         if self.get_current_level() == 4:
-            upgrades_list.append(None)      #return none in list if is max level
-        else:
-            for child in self.tree.get(self.current_node, []):
-                upgrade_cost = self.values[child][1]
-                if int(current_money) >= int(upgrade_cost):
-                    select_number = self.values[child][0]            
-                    upgrades_list.append((select_number, upgrade_cost))
+            return [], []
 
-            if not upgrades_list:
-                upgrades_list.append(None)
+        #possible upgrades -> upgrades_list, impossible -> wait_list
+        for child in self.tree.get(self.current_node, []):
+            upgrade_cost = self.values[child][1]
+            select_number = self.values[child][0]
 
-        return upgrades_list
+            if int(current_money) >= int(upgrade_cost):
+                upgrades_list.append((select_number, upgrade_cost))
+            else:
+                wait_list.append((select_number, upgrade_cost))
+
+        return upgrades_list, wait_list
 
 class ImageProcessor:
     def __init__(self):
         self.reader = easyocr.Reader(['en'])
 
-
+    #used for testing pixel locations
     def display_window(self, bbox):
         while True:
             if keyboard.is_pressed('space'):
@@ -513,8 +532,8 @@ class ImageProcessor:
     def detect_end_game(self, img, text):
         result = self.reader.readtext(np.array(img))
         if result:
-            for item in result:
-                detected_text = item[1] 
+            for item in result:         #check if result is "Total:", if so remove total and return the remaining
+                detected_text = item[1]             #which should be the score
                 if detected_text.startswith(text):
                     remaining_text = detected_text[len(text):].strip()
                     return remaining_text
@@ -540,8 +559,8 @@ class Actions:
         self.start_game_button = 350, 400
         self.to_menu_button = 320, 400
 
-        self.tower_size = 20        #22
-        self.tower_start = 15, 45    #20, 53
+        self.tower_size = 20 
+        self.tower_start = 15, 45
 
         self.processor = ImageProcessor()
 
@@ -676,8 +695,10 @@ class AntbusterEnv:
         self.grid = None
         self.game_instance = None
         self.tower_decision_net = tower_decision_net
+        self.decision_delay = 0
         self.tower_decision_net.train()      #testing set to eval
 
+    #resets grid and game instance for each new game, and clicks menu start button
     def start_new_game(self):
         self.grid = TowerGrid()
         self.game_instance = GameInstance(self.actions)
@@ -693,108 +714,83 @@ class AntbusterEnv:
         action_log = []
 
         self.epsilon = epsilon
-        self.actions_completed = 0
+        self.decision_delay = decision_delay
 
+        #get q values, interprate, execute chosen and log q
         while self.game_instance.game_running:
-            valid_placement_probs, valid_upgrade_probs, wait_prob, state = self.get_choices()
-            chosen_action = self.get_sample_choice(valid_placement_probs, valid_upgrade_probs, wait_prob, epsilon)
+            valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs = self.get_choices()
+            chosen_action = self.get_sample_choice(valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs, epsilon)
 
-            num_selected = None
-            if chosen_action[1] == "upgrade":
-                num_selected, num_prob = self.extract_best_upgrade_path(chosen_action)
-                chosen_action = chosen_action + (num_prob,)
+            action_log.append(chosen_action)
+            self.execute_choice(chosen_action)
 
-            if log_decisions:
-                action_log.append({
-                "action": chosen_action,        #upgrade_prob, "upgrade type", (y, x) (upgrade only after here) upgrade_info, tower_specific_probs, num_prob
-                "state": state                  #grid_tensor, new_tower_cost, current_money, possible_tower_upgrades
-            })
-                
-            self.execute_choice(chosen_action, num_selected)
-            time.sleep(decision_delay)
+            time.sleep(self.decision_delay)
         score = self.game_instance.get_score()
         return score, action_log
 
-    def get_sample_choice(self, valid_placement_locations, current_tower_locations, wait_prob, epsilon):
-        choices = []
-        choices = valid_placement_locations + current_tower_locations + wait_prob
-
-        q_values = [choice[0] for choice in choices]
+    def get_sample_choice(self, valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs, epsilon):
+        action_types = []
+        if valid_placement_probs:
+            action_types.append(valid_placement_probs)
+        if valid_upgrade_probs:
+            action_types.append(valid_upgrade_probs)
+        if wait_placement_probs:
+            action_types.append(wait_placement_probs)
+        if wait_upgrade_probs:
+            action_types.append(wait_upgrade_probs)
 
         if random.random() < epsilon:
-            sampled_index = random.randint(0, len(choices) - 1)
+            #exploration (chose random action)
+            sampled_action_type = random.choice(action_types)
+            chosen_action = random.choice(sampled_action_type)
         else:
-            sampled_index = q_values.index(max(q_values))
+            #exploitation (chose best action)
+            best_choices = [
+                action for action_list in action_types for action in action_list
+            ]
 
-        chosen_action = choices[sampled_index]
+            chosen_action = max(best_choices, key=lambda x: x[0])  
 
-        self.actions_completed += 1
         return chosen_action
 
-    def execute_choice(self, choice, num_selected = None):
+    def execute_choice(self, choice):
         if choice[1] == "place":
             #print(f"place {choice[2][1]}, {choice[2][0]}")
-            self.actions.place_new_tower(choice[2][1], choice[2][0])
+            self.actions.place_new_tower(choice[2][0], choice[2][1])
         elif choice[1] == "upgrade":
-            if num_selected is not None:
-                #print(f"upgrade {choice[2][1]}, {choice[2][0]}")
-                self.actions.upgrade_tower(choice[2][1], choice[2][0], num_selected)
-        elif choice[1] == "wait":
-            #print(f"wait: {choice[0]}")
-            return
+            #print(f"upgrade {choice[2][1]}, {choice[2][0]}")
+            self.actions.upgrade_tower(choice[2][0], choice[2][1], choice[3])
+        elif choice[1] == "wupgrade":
+            self.wait_for_choice(choice[4])
+            if self.game_instance.game_running:
+                self.actions.upgrade_tower(choice[2][0], choice[2][1], choice[3])
+        elif choice[1] == "wplace":
+            self.wait_for_choice(choice[3])
+            if self.game_instance.game_running:
+                self.actions.place_new_tower(choice[2][0], choice[2][1])
 
-    #depritiated
-    def execute_best_choice(self, valid_placement_locations, current_tower_locations, wait_prob):
-        choices = valid_placement_locations + current_tower_locations + wait_prob
-        choices.sort(key=lambda x: x[0], reverse=True)
-
-        for choice in choices:
-            if choice[1] == "place":
-                #print(f"place {choice[2][1]}, {choice[2][0]}")
-                self.actions.place_new_tower(choice[2][1], choice[2][0])
-                break
-            elif choice[1] == "upgrade":
-                num_selected = self.extract_best_upgrade_path(choice)
-                if num_selected is not None:
-                    #print(f"upgrade {choice[2][1]}, {choice[2][0]}")
-                    self.actions.upgrade_tower(choice[2][1], choice[2][0], num_selected)
-                    break
-                else:
-                    continue
-            elif choice[1] == "wait":
-                #print(f"wait: {choice[0]}")
-                break
-
-    def extract_best_upgrade_path(self, upgrades):
-        _, _, _, upgrade_info, upgrade_probs = upgrades  # unpack
-        repack = []
-        
-        for index, info in enumerate(upgrade_info):
-            _, cost = info
-            repack.append((upgrade_probs[index], info))
-
-        if not repack:
-            return None
-
-        best_upgrade = max(repack, key=lambda item: item[0])
-
-        return best_upgrade[1][0], best_upgrade[0]
+    #wait until money is greater than cost of chosen action
+    def wait_for_choice(self, cost):
+        while self.game_instance.get_money() < cost and self.game_instance.game_running:
+            self.game_instance.set_money()
+            time.sleep(self.decision_delay)
         
     def get_choices(self):
         self.game_instance.set_money()
         current_money = self.game_instance.get_money()
 
         valid_locations = self.grid.getValidTowerLocations()
-        tower_locations = self.grid.get_possible_upgrades(current_money)
+        tower_locations, invalid_locations = self.grid.get_possible_upgrades(current_money)
         new_tower_cost = self.grid.get_new_tower_cost()
 
         tensor = self.grid.grid_to_tensor()
 
-        self.tower_decision_net(tensor, new_tower_cost, current_money, tower_locations)
+        self.tower_decision_net(tensor, new_tower_cost, current_money, tower_locations, invalid_locations)
 
-        valid_placement_probs, valid_upgrade_probs, wait_prob, state = self.tower_decision_net.make_decision_lists(tensor, valid_locations, tower_locations, new_tower_cost, current_money)
+        valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs = self.tower_decision_net.make_decision_lists(
+            tensor, valid_locations, tower_locations, invalid_locations, new_tower_cost, current_money)
 
-        return valid_placement_probs, valid_upgrade_probs, wait_prob, state
+        return valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs
 
     def plot(self, valid_placement_probs):
         x_coords = [coord[2][1] for coord in valid_placement_probs]  #x coordinates from (y, x)
@@ -818,109 +814,124 @@ class TowerDecisionNet(nn.Module):
     def __init__(self):
         super(TowerDecisionNet, self).__init__()
         #convolutional layers to extract spatial features from the grid
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)  #input: 1 channel (grid), output: 16 feature maps
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)     #1 (grid) -> 16
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)    #16 -> 32
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)    #32 -> 64
+
         #fully connected layers for current_money and new_tower_cost
-        self.money_fc = nn.Linear(1, 32)  #for current_money (1 input -> 32 outputs)
-        self.cost_fc = nn.Linear(1, 32)   #for new_tower_cost (1 input -> 32 outputs)
-        
-        #final layer that combines grid, money, and cost features
-        self.conv4 = nn.Conv2d(128, 2, kernel_size=1)  #concatenate 64 grid + 32 money + 32 cost features
+        self.money_fc = nn.Linear(1, 32)  #1 -> 32
+        self.cost_fc = nn.Linear(1, 32)   #1 -> 32
 
-        self.upgrade_fc = nn.Linear(64, 3)  #produces 3 probabilities for the 3 upgrade choices
+        #final layer for placing new towers
+        self.place_conv = nn.Conv2d(128, 1, kernel_size=1)  #outputs 1 channel for place probs
 
-        self.wait_fc = nn.Linear(64, 1) #1 prob for wait
+        #fully connected layers for upgrades and waiting
+        self.upgrade_fc = nn.Linear(64, 3)  #outputs 3 channels for valid upgrades
+        self.wait_fc = nn.Linear(64, 3)     #outputs 3 channels for wait upgrades
 
-    def forward(self, x, new_tower_cost, current_money, tower_locations):
+    def forward(self, x, new_tower_cost, current_money, possible_tower_upgrades, too_expensive_upgrades):
         base = x
-        #turn cost and money to tensor, consider having this done in pass?
+        #convert cost and money to tensors, should maybe change this to do before theyre passed
         if isinstance(current_money, int):
             current_money = torch.tensor([current_money], dtype=torch.float32, device=x.device)
         if isinstance(new_tower_cost, int):
             new_tower_cost = torch.tensor([new_tower_cost], dtype=torch.float32, device=x.device)
         
-        # Process grid features
+        #process grid features
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         grid_features = F.relu(self.conv3(x))  #[batch, 64, height, width]
 
-        # Process current_money and reshape
+        #process current_money and reshape
         money_features = F.relu(self.money_fc(current_money.view(-1, 1)))  #[batch, 32]
-        money_features = money_features.view(-1, 32, 1, 1)  #reshape for broadcast
+        money_features = money_features.view(-1, 32, 1, 1)  #reshape for broadcasting
 
-        # Process new_tower_cost and reshape
+        #process new_tower_cost and reshape
         cost_features = F.relu(self.cost_fc(new_tower_cost.view(-1, 1)))  #[batch, 32]
         cost_features = cost_features.view(-1, 32, 1, 1)  #reshape for broadcasting
 
-        #concatenate grid, money, and cost features
-        combined_features = torch.cat((grid_features,
-                                    money_features.expand(-1, -1, grid_features.size(2), grid_features.size(3)),
-                                    cost_features.expand(-1, -1, grid_features.size(2), grid_features.size(3))), dim=1)
+        #concat grid, money, and cost features
+        combined_features = torch.cat(
+            (
+                grid_features,
+                money_features.expand(-1, -1, grid_features.size(2), grid_features.size(3)),
+                cost_features.expand(-1, -1, grid_features.size(2), grid_features.size(3))
+            ), dim=1
+        )
 
-        #final convolution to produce placement and upgrade probabilities
-        prob_map = torch.sigmoid(self.conv4(combined_features))  #prob map for both placement & upgrade
+        #generate probabilities for placing new towers
+        place_map = torch.sigmoid(self.place_conv(combined_features)).squeeze(1)  #[batch, height, width]
 
-        wait_prob = torch.sigmoid(self.wait_fc(grid_features.mean(dim=[2, 3]))) #create wait prob
-
-        tower_upgrade_probs = {}
-        if tower_locations:
-            for loc in tower_locations:
-                (col, row), _ = loc
+        #generate probabilities for upgrading towers
+        tower_upgrade_map = {}
+        if possible_tower_upgrades:
+            for (col, row), upgrade_info in possible_tower_upgrades:
                 if base[0, 0, row, col] >= 2:  #check for tower
-                    #extract tower features
                     tower_features = grid_features[:, :, row, col]  #[batch, 64]
-                    
-                    #pass through fully connected layer for upgrade choices
-                    upgrade_prob = F.softmax(self.upgrade_fc(tower_features), dim=-1)  #[batch, 3]
-                    
-                    #store the upgrade probabilities for this tower location
-                    tower_upgrade_probs[(row, col)] = upgrade_prob.squeeze(0).tolist()
+                    upgrade_probs = F.softmax(self.upgrade_fc(tower_features), dim=-1)  #[batch, 3]
+                    tower_upgrade_map[(row, col)] = upgrade_probs.squeeze(0).tolist()
 
-        return prob_map.squeeze(1), tower_upgrade_probs, wait_prob.squeeze(1)  # [placement_prob, upgrade_probs_per_tower, wait_prob]
+        #generate probabilities for waiting to upgrade towers
+        tower_wait_map = {}
+        if too_expensive_upgrades:
+            for (col, row), upgrade_info in too_expensive_upgrades:
+                if base[0, 0, row, col] >= 2:  #check for a tower
+                    tower_features = grid_features[:, :, row, col]  #[batch, 64]
+                    wait_probs = F.softmax(self.wait_fc(tower_features), dim=-1)  #[batch, 3]
+                    tower_wait_map[(row, col)] = wait_probs.squeeze(0).tolist()
 
-    def make_decision_lists(self, grid_tensor, valid_placement_locations, possible_tower_upgrades, new_tower_cost, current_money):
-        prob_grid, tower_upgrade_probs, raw_wait_prob = self.forward(grid_tensor, new_tower_cost, current_money, possible_tower_upgrades)
+        return place_map, tower_upgrade_map, tower_wait_map
+
+    def make_decision_lists(self, grid_tensor, valid_placement_locations, possible_tower_upgrades, too_expensive_upgrades, new_tower_cost, current_money):
+        place_map, tower_upgrade_map, tower_wait_map = self.forward(
+            grid_tensor, new_tower_cost, current_money, possible_tower_upgrades, too_expensive_upgrades
+        )
 
         valid_placement_probs = []
         valid_upgrade_probs = []
-        action_wait = [(raw_wait_prob[0].item(), "wait")]
+        wait_placement_probs = []
+        wait_upgrade_probs = []
 
-        state = [grid_tensor, new_tower_cost, current_money, possible_tower_upgrades]
-
-        #check if possible to get new tower before running calculations
+        #collect placement probabilities, if it cant afford new tower place the probs in wait
         if current_money >= new_tower_cost:
-            placement_probs = prob_grid[0, 0]
-
             for (y, x) in valid_placement_locations:
-                placement_prob = placement_probs[y, x].item()
-                valid_placement_probs.append((placement_prob, "place", (y, x)))
+                placement_prob = place_map[0, y, x].item()
+                valid_placement_probs.append((placement_prob, "place", (x, y)))
+        else:
+            for (y, x) in valid_placement_locations:
+                placement_prob = place_map[0, y, x].item()
+                wait_placement_probs.append((placement_prob, "wplace", (x, y), new_tower_cost))
 
-
-            #valid_placement_probs.sort(key=lambda x: x[0], reverse=True)   #add back if need pre sorting
-
-        #check if towers are available to upgrade before doing calculations
-        if len(possible_tower_upgrades) > 0:
-            upgrade_probs = prob_grid[0, 1]  
-
+        #collect valid upgrade probabilities
         for (x, y), upgrade_info in possible_tower_upgrades:
-            upgrade_prob = upgrade_probs[y, x].item()
-            
-            #pack upgrade probs for existing towers, and the upgrade probs for each choice
-            if (y, x) in tower_upgrade_probs:
-                tower_specific_probs = tower_upgrade_probs[(y, x)]
-                valid_upgrade_probs.append((upgrade_prob, "upgrade", (y, x), upgrade_info, tower_specific_probs))
+            if (y, x) in tower_upgrade_map:
+                specific_probs = tower_upgrade_map[(y, x)]
+                
+                for id, (upgrade_number, upgrade_cost) in enumerate(upgrade_info):
+                    if id < len(specific_probs):
+                        specific_prob = specific_probs[id]
+                        valid_upgrade_probs.append((specific_prob, "upgrade", (x, y), upgrade_number, upgrade_cost))
 
-        return valid_placement_probs, valid_upgrade_probs, action_wait, state
+        #collect too expensive probabilities for wait
+        for (x, y), upgrade_info in too_expensive_upgrades:
+            if (y, x) in tower_wait_map:
+                specific_probs = tower_wait_map[(y, x)]
+                
+                for id, (upgrade_number, upgrade_cost) in enumerate(upgrade_info):
+                    if id < len(specific_probs):
+                        specific_prob = specific_probs[id]
+                        wait_upgrade_probs.append((specific_prob, "wupgrade", (x, y), upgrade_number, upgrade_cost))
+
+        return valid_placement_probs, valid_upgrade_probs, wait_placement_probs, wait_upgrade_probs
 
 class AntBusterTrainer:
-    def __init__(self, env, tower_decision_net, log_file, learning_rate=1e-4, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.1):
+    def __init__(self, env, tower_decision_net, log_file, model_save_location, learning_rate=1e-4, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.1):
         self.tower_decision_net = tower_decision_net
         self.env = env
         self.gamma = gamma
         self.optimizer = optim.Adam(self.env.tower_decision_net.parameters(), lr=learning_rate)
         self.log_file = log_file
+        self.model_save_location = model_save_location
 
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
@@ -932,30 +943,27 @@ class AntBusterTrainer:
       
     def train(self, num_games):
         game_attempts = 0
+
+        #load model
+        try:
+            trainer.load_model(self.model_save_location)
+        except FileNotFoundError:
+            print(f"Model file not found at {self.model_save_location}. Starting with a fresh model.")
+
         while game_attempts < num_games:
+            
+
             time.sleep(1)   #delay between games to prevent issues with loading
 
 
-            start_time = time.time()
-            # Play a game and collect rewards
-            score, action_log = self.env.play_game(.5, self.epsilon, True)
+            start_time = time.time()    #log game time
 
-
-            actions = [entry["action"] for entry in action_log]
-
-            q_values = []
-
-            for action in actions:
-                if action[1] == "upgrade":
-                    q_values.append(action[0])
-                    q_values.append(action[5])
-                else:
-                    q_values.append(action[0])
-
-            
+            score, action_log = self.env.play_game(.1, self.epsilon, True)  #play one game and get score & action
 
             end_time = time.time()
             game_time = end_time - start_time
+
+            q_values = [entry[0] for entry in action_log]  
 
             try:
                 score = float(score)  #if value fails to convert to float (bad int), skip and play another
@@ -963,22 +971,23 @@ class AntBusterTrainer:
                 print(f"Invalid score encountered: {score} on attempt {game_attempts + 1}. Disregarding and trying again.")
                 continue
             
-            reward = self.compute_discounted_rewards(score, len(q_values))
+            reward = self.compute_discounted_rewards(score, len(q_values))  #calculate score per action
 
-            state_action_values = torch.tensor(q_values, requires_grad=True)
-            loss = F.mse_loss(state_action_values, reward)
+            state_action_values = torch.tensor(q_values, requires_grad=True)    
+            loss = F.mse_loss(state_action_values, reward)          #calculate loss
 
 
             self.optimizer.zero_grad()
-            loss.backward()
+            loss.backward() 
             self.optimizer.step()
 
             game_attempts += 1
 
             
-            self.log_game_metrics(game_attempts, score, loss.item(), game_time, self.epsilon, action_log)
+            self.log_game_metrics(score, loss.item(), game_time, self.epsilon, action_log)
             print(f"Game {game_attempts}/{num_games}, Score: {score}, Loss: {loss.item()}, Exploration Rate: {self.epsilon}")
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            self.save_model(self.model_save_location)
 
     def compute_discounted_rewards(self, final_score, num_steps):
         rewards = [0] * num_steps
@@ -988,19 +997,34 @@ class AntBusterTrainer:
             cumulative_reward *= self.gamma
         return torch.tensor(rewards, dtype=torch.float32)
 
-    def log_game_metrics(self, game_num, score, loss, game_time, epsilon, action_log):
+    def log_game_metrics(self, score, loss, game_time, epsilon, action_log):
         place_data = []
         upgrade_data = []
+        actions = []
 
         for entry in action_log:
-            action_type = entry["action"][1]
-            if action_type == "place":
-                x, y = entry["action"][2][1], entry["action"][2][0]
+            if entry[1] == "place" or entry[1] == "wplace":
+                x, y = entry[2][0], entry[2][1]
                 place_data.append({"x": x, "y": y})
-            elif action_type == "upgrade":
-                x, y = entry["action"][2][1], entry["action"][2][0]
-                num_selected = entry["action"][5]
+            elif entry[1] == "upgrade" or entry[1] == "wupgrade":
+                x, y = entry[2][0], entry[2][1]
+                num_selected = entry[3]
                 upgrade_data.append({"x": x, "y": y, "upgrade num": num_selected})
+                
+            actions.append(entry[1])
+
+        try:
+            with open(self.log_file, 'r') as file:
+                log_data = json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            log_data = {"games": []}
+
+        #determine the next game number, should be last + 1
+        if log_data["games"]:
+            last_game_num = log_data["games"][-1]["game"]
+            game_num = last_game_num + 1
+        else:
+            game_num = 1
 
         game_data = {
             "game" : game_num,
@@ -1008,8 +1032,9 @@ class AntBusterTrainer:
             "loss" : loss,
             "game time" : game_time,
             "explore rate" : epsilon,
+            "actions" : actions,
             "tower locations" : place_data,
-            "upgrade steps" : upgrade_data
+            "upgrades" : upgrade_data
         }
 
         with open(self.log_file, 'r') as file:
@@ -1030,23 +1055,14 @@ class AntBusterTrainer:
 if __name__ == "__main__":
     FLASH_PROJECTOR_PATH = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\Windows-Flash-Projector.exe"
     ANTBUSTER_SWF_PATH = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\antbuster-522.swf"
-    MODEL_SAVE_LOCATION = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\AI\AI ATTEMPTS\test_2\tower_decision_model.pth"
-    JSON_SAVE_LOCATION = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\AI\AI ATTEMPTS\test_2\model_log.json"
+    MODEL_SAVE_LOCATION = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\AI\AI ATTEMPTS\test_3\tower_decision_model.pth"
+    JSON_SAVE_LOCATION = r"C:\Users\malon\OneDrive\Desktop\ANTBUSTER\AI\AI ATTEMPTS\test_3\model_log.json"
     
     tower_decision_net = TowerDecisionNet()
 
     env = AntbusterEnv(FLASH_PROJECTOR_PATH, ANTBUSTER_SWF_PATH, tower_decision_net)
 
-    trainer = AntBusterTrainer(env, tower_decision_net, JSON_SAVE_LOCATION)
-    time.sleep(10)
+    trainer = AntBusterTrainer(env, tower_decision_net, JSON_SAVE_LOCATION, MODEL_SAVE_LOCATION, epsilon=0.1)
+    time.sleep(20)
 
-    try:
-        trainer.load_model(MODEL_SAVE_LOCATION)
-        print("Loaded saved model successfully.")
-    except FileNotFoundError:
-        print(f"Model file not found at {MODEL_SAVE_LOCATION}. Starting with a fresh model.")
-
-    trainer.train(10)
-
-    trainer.save_model(MODEL_SAVE_LOCATION)
-
+    trainer.train(3)
